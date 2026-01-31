@@ -16,8 +16,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-/* ================= CONFIG ================= */
-
 type Config struct {
 	Email         string
 	Password      string
@@ -76,8 +74,6 @@ func loadConfig() Config {
 	}
 }
 
-/* ================= IMAP ================= */
-
 func connect(cfg Config) (*client.Client, error) {
 	addr := fmt.Sprintf("%s:%d", cfg.ImapServer, cfg.ImapPort)
 
@@ -124,8 +120,6 @@ func listMailboxes(c *client.Client) ([]string, error) {
 	return boxes, <-done
 }
 
-/* ================= STORAGE ================= */
-
 func mailboxDir(base, box string) string {
 	safe := strings.ReplaceAll(box, "/", "_")
 	return filepath.Join(base, safe)
@@ -147,12 +141,9 @@ func exists(path string) bool {
 	return err == nil
 }
 
-/* ================= WORKER ================= */
-
 func processMailbox(c *client.Client, box string, cfg Config, downloaded *uint64, mu *sync.RWMutex) {
 	logrus.Infof("Processing: %s", box)
 
-	// Sequential SELECT with retry
 	var mboxStatus *imap.MailboxStatus
 	var selectErr error
 	for retry := 0; retry < 3; retry++ {
@@ -167,58 +158,105 @@ func processMailbox(c *client.Client, box string, cfg Config, downloaded *uint64
 	}
 
 	if selectErr != nil || mboxStatus == nil || mboxStatus.Messages == 0 {
-		logrus.Infof("Skipping %s: empty or SELECT failed", box)
+		logrus.Infof("  Skipping %s: empty or SELECT failed", box)
 		return
 	}
 
-	// Skip huge mailboxes
-	if mboxStatus.Messages > 50000 {
-		logrus.Warnf("Skipping huge mailbox %s (%d msgs)", box, mboxStatus.Messages)
-		return
-	}
+	logrus.Infof("%s: %d total messages (UID range 1-%d)", box, mboxStatus.Messages, mboxStatus.UidNext-1)
 
 	if err := ensureDir(mailboxDir(cfg.BackupDir, box), cfg.DryRun); err != nil {
 		logrus.Warnf("Failed to create dir for %s: %v", box, err)
 		return
 	}
 
-	// Phase 1: Get missing UIDs
-	logrus.Debugf("Scanning UIDs for %s (%d total)", box, mboxStatus.Messages)
-	uidSeq := new(imap.SeqSet)
-	uidSeq.AddRange(1, mboxStatus.UidNext-1)
-	uidMsgs := make(chan *imap.Message, 1000)
+	logrus.Infof("Scanning UIDs for %s (%d messages)", box, mboxStatus.Messages)
 
-	if err := c.UidFetch(uidSeq, []imap.FetchItem{imap.FetchUid}, uidMsgs); err != nil {
-		logrus.Warnf("UID scan failed for %s: %v", box, err)
-		return
-	}
+	missingUIDs := make([]uint32, 0, mboxStatus.Messages/10)
+	chunkSize := uint32(2000)
+	totalChunks := (mboxStatus.UidNext + chunkSize - 1) / chunkSize
 
-	missingUIDs := make([]uint32, 0, mboxStatus.Messages)
-	for msg := range uidMsgs {
-		path := messagePath(cfg.BackupDir, box, uint64(msg.Uid))
-		if !exists(path) {
-			missingUIDs = append(missingUIDs, msg.Uid)
+	scanStart := time.Now()
+	for chunkStart := uint32(1); chunkStart < mboxStatus.UidNext; chunkStart += chunkSize {
+		chunkEnd := chunkStart + chunkSize - 1
+		if chunkEnd > mboxStatus.UidNext {
+			chunkEnd = mboxStatus.UidNext
+		}
+
+		shortBox := box
+		if len(box) > 20 {
+			shortBox = box[:20]
+		}
+		chunkNum := (chunkStart-1)/chunkSize + 1
+		pct := int(100 * float64(chunkStart) / float64(mboxStatus.UidNext))
+		logrus.Infof("[%s] Chunk %d/%d (UIDs %d-%d) %d%%",
+			shortBox, chunkNum, totalChunks, chunkStart, chunkEnd, pct)
+
+		uidSeq := new(imap.SeqSet)
+		uidSeq.AddRange(chunkStart, chunkEnd)
+		uidMsgs := make(chan *imap.Message, 200)
+
+		if err := c.UidFetch(uidSeq, []imap.FetchItem{imap.FetchUid}, uidMsgs); err != nil {
+			logrus.Warnf("└─ Chunk %d-%d failed: %v", chunkStart, chunkEnd, err)
+			continue
+		}
+
+		chunkMissing := 0
+		for msg := range uidMsgs {
+			path := messagePath(cfg.BackupDir, box, uint64(msg.Uid))
+			if !exists(path) {
+				missingUIDs = append(missingUIDs, msg.Uid)
+				chunkMissing++
+			}
+		}
+
+		if chunkNum%5 == 0 || chunkNum == totalChunks {
+			scanElapsed := time.Since(scanStart).Seconds()
+			remainingChunks := totalChunks - chunkNum
+			eta := scanElapsed * float64(remainingChunks) / float64(chunkNum)
+			logrus.Infof("Scan progress: %d/%d chunks, %d missing so far (ETA: %.0fs)",
+				chunkNum, totalChunks, len(missingUIDs), eta)
 		}
 	}
 
+	scanElapsed := time.Since(scanStart).Seconds()
+	pctMissing := 100 * float64(len(missingUIDs)) / float64(mboxStatus.Messages)
+	logrus.Infof("Scan complete: %.1fs, found %d missing / %.1f%% of %d total",
+		scanElapsed, len(missingUIDs), pctMissing, mboxStatus.Messages)
+
 	if len(missingUIDs) == 0 {
-		logrus.Infof("Mailbox %s: Nothing to download (%d total)", box, mboxStatus.Messages)
+		logrus.Infof("%s: Nothing new to download", box)
 		return
 	}
 
-	logrus.Infof("Mailbox %s: %d missing messages", box, len(missingUIDs))
+	// Download with progress
+	logrus.Infof("  Downloading %d messages from %s", len(missingUIDs), box)
 
-	// Phase 2: Fetch SINGLE messages only
-	for _, uid := range missingUIDs {
+	downloadStart := time.Now()
+	savedCount := 0
+
+	for i, uid := range missingUIDs {
+		// Progress every 100 messages
+		if i > 0 && i%100 == 0 {
+			pct := 100 * float64(i) / float64(len(missingUIDs))
+			elapsed := time.Since(downloadStart).Seconds()
+			rate := float64(i) / elapsed
+			eta := elapsed * float64(len(missingUIDs)-i) / float64(i)
+			shortBox := box
+			if len(box) > 20 {
+				shortBox = box[:20]
+			}
+			logrus.Infof("⬇️  [%s] %d/%d (%.1f%%, %.0f msg/s, ETA: %.0fs)",
+				shortBox, i, len(missingUIDs), pct, rate, eta)
+		}
+
 		seq := new(imap.SeqSet)
 		seq.AddNum(uid)
-
 		section := &imap.BodySectionName{Peek: true}
 		items := []imap.FetchItem{section.FetchItem()}
 		msgs := make(chan *imap.Message, 1)
 
 		if err := c.UidFetch(seq, items, msgs); err != nil {
-			logrus.Warnf("Fetch failed UID %d in %s: %v", uid, box, err)
+			logrus.Debugf("Fetch failed UID %d: %v", uid, err)
 			continue
 		}
 
@@ -234,29 +272,30 @@ func processMailbox(c *client.Client, box string, cfg Config, downloaded *uint64
 
 		data, err := io.ReadAll(body)
 		if err != nil {
-			logrus.Warnf("Read failed UID %d in %s: %v", uid, box, err)
+			logrus.Debugf("Read failed UID %d: %v", uid, err)
 			continue
 		}
 
 		path := messagePath(cfg.BackupDir, box, uint64(uid))
 		if cfg.DryRun {
-			logrus.Debugf("[DRY-RUN] Would write %s (%d bytes)", path, len(data))
 			continue
 		}
 
-		if writeErr := os.WriteFile(path, data, 0644); writeErr != nil {
-			logrus.Warnf("Write failed %s: %v", path, writeErr)
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			logrus.Debugf("Write failed %s: %v", path, err)
 			continue
 		}
 
+		savedCount++
 		mu.Lock()
 		*downloaded++
 		mu.Unlock()
-		logrus.Debugf("Saved UID %d -> %s (%d bytes)", uid, path, len(data))
 	}
-}
 
-/* ================= MAIN ================= */
+	downloadElapsed := time.Since(downloadStart).Seconds()
+	logrus.Infof("%s COMPLETE: %d/%d saved (%.1f msg/s)",
+		box, savedCount, len(missingUIDs), float64(savedCount)/downloadElapsed)
+}
 
 func main() {
 	cfg := loadConfig()
@@ -283,17 +322,30 @@ func main() {
 	var downloaded uint64
 	mu := sync.RWMutex{}
 
-	// SEQUENTIAL PROCESSING - NO GOROUTINES
+	// Parallel processing using workers
+	sem := make(chan struct{}, cfg.MaxWorkers)
+	var wg sync.WaitGroup
+
+	logrus.Infof("Starting backup with %d workers across %d mailboxes", cfg.MaxWorkers, len(mailboxes))
+
 	for _, box := range mailboxes {
 		if len(cfg.FoldersOnly) > 0 && !cfg.FoldersOnly[box] {
 			continue
 		}
 
-		processMailbox(c, box, cfg, &downloaded, &mu)
+		// Wait for available worker slot
+		sem <- struct{}{}
+		wg.Add(1)
 
-		// Rate limiting between mailboxes
-		time.Sleep(500 * time.Millisecond)
+		go func(boxName string) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release worker slot
+
+			processMailbox(c, boxName, cfg, &downloaded, &mu)
+		}(box)
 	}
+
+	wg.Wait()
 
 	elapsed := time.Since(start).Seconds()
 	if elapsed > 0 {
