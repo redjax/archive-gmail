@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -54,6 +55,9 @@ func LoadConfig() Config {
 		}
 	}
 
+	home, _ := os.UserHomeDir()
+	defaultTokenFile := filepath.Join(home, ".config", "archive_gmail", "token.json")
+
 	return Config{
 		Email:           os.Getenv("GMAIL_EMAIL"),
 		Password:        os.Getenv("GMAIL_PASSWORD"),
@@ -61,12 +65,12 @@ func LoadConfig() Config {
 		ImapServer:      getenv("IMAP_SERVER", "imap.gmail.com"),
 		ImapPort:        getenvInt("IMAP_PORT", 993),
 		FoldersOnly:     folders,
-		MaxWorkers:      getenvInt("MAX_WORKERS", 1), // Single worker
+		MaxWorkers:      getenvInt("MAX_WORKERS", 1),
 		DryRun:          getenvBool("DRY_RUN", false),
 		TLSSkipVerify:   getenvBool("TLS_SKIP_VERIFY", false),
 		LogLevel:        getenv("LOG_LEVEL", "INFO"),
 		ClientID:        getenv("GMAIL_CLIENT_ID", ""),
 		ClientSecret:    getenv("GMAIL_CLIENT_SECRET", ""),
-		OAuth2TokenFile: getenv("OAUTH2_TOKEN_FILE", ""),
+		OAuth2TokenFile: getenv("OAUTH2_TOKEN_FILE", defaultTokenFile),
 	}
 }
