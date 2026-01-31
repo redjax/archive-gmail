@@ -2,6 +2,8 @@
 
 Little Go app for local archive of Gmail mailbox. Connects to Gmail via IMAP and iterates over whole mailbox and folders, downloading each message.
 
+Unfortunately, IMAP is pretty slow. The app takes a very long time to run, especially if you have a lot of emails. Just run it in the background and let it do its thing.
+
 ## Table of Contents <!-- omit in toc -->
 
 - [Requirements](#requirements)
