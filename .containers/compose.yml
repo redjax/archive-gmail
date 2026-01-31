@@ -19,4 +19,4 @@ services:
     env_file:
       - .env
     volumes:
-      - ${BACKUP_DIR:-archive-gmail_mailbox}:/app/backups
+      - ${HOST_BACKUP_DIR:-archive-gmail_mailbox}:/app/backups
