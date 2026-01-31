@@ -1,0 +1,5 @@
+[tools]
+## https://mise-tools.jdx.dev/tools/go
+go = "1.25.4"
+## https://mise-tools.jdx.dev/tools/goreleaser
+goreleaser = "latest"
