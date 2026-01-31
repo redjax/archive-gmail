@@ -1,11 +1,13 @@
 # Archive Gmail <!-- omit in toc -->
 
-Little Go app for local archive of Gmail mailbox.
+Little Go app for local archive of Gmail mailbox. Connects to Gmail via IMAP and iterates over whole mailbox and folders, downloading each message.
 
 ## Table of Contents <!-- omit in toc -->
 
 - [Requirements](#requirements)
 - [Setup](#setup)
+- [Build](#build)
+- [Install](#install)
 - [OAuth Setup](#oauth-setup)
 
 ## Requirements
@@ -23,9 +25,33 @@ Set the following environment variables (if you're using `direnv`, create a `.en
 - `FOLDERS_ONLY`: (default: "") Optional comma-separated list of folders to download
   - Example: INBOX,[Gmail]/All Mail
 
+## Build
+
+Run [one of the build scripts](./scripts/build), or one of the commands below. Run `mkdir dist` to ensure the output directory exists.
+
+Build with Go:
+
+```shell
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/archive-gmail ./cmd/archive-gmail
+```
+
+Build with GoReleaser:
+
+```shell
+goreleaser release --snapshot --clean
+```
+
+## Install
+
+Place the [binary you built to `dist/archive-gmail[.exe]`](#build) somewhere in your `$PATH`, i.e. `~/.local/bin/archive-gmail` (on Linux). You may have to add this to your `~/.bashrc`:
+
+```text
+export PATH="$PATH:$HOME/.local/bin"
+```
+
 ## OAuth Setup
 
-> [!WARN]
+> [!WARNING]
 > OAuth2 is not implemented yet
 
 *[Google OAuth client ID & secret](https://developers.google.com/identity/protocols/oauth2)*
