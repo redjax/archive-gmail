@@ -16,10 +16,16 @@ func main() {
 	level, _ := logrus.ParseLevel(cfg.LogLevel)
 	logrus.SetLevel(level)
 
-	if cfg.Email == "" || cfg.Password == "" {
-		logrus.Fatal("GMAIL_EMAIL and GMAIL_PASSWORD are required")
+	// SINGLE validation block - OAuth2 OR Password
+	useOAuth2 := cfg.ClientID != "" && cfg.ClientSecret != ""
+	if cfg.Email == "" {
+		logrus.Fatal("GMAIL_EMAIL is required")
+	}
+	if !useOAuth2 && cfg.Password == "" {
+		logrus.Fatal("Either GMAIL_PASSWORD OR (GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET) required")
 	}
 
+	// Connect handles auth logic
 	c, err := gmailSvc.Connect(cfg)
 	if err != nil {
 		logrus.Fatalf("IMAP connect failed: %v", err)

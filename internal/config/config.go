@@ -17,6 +17,10 @@ type Config struct {
 	DryRun        bool
 	TLSSkipVerify bool
 	LogLevel      string
+
+	ClientID        string
+	ClientSecret    string
+	OAuth2TokenFile string
 }
 
 func getenv(key, def string) string {
@@ -51,15 +55,18 @@ func LoadConfig() Config {
 	}
 
 	return Config{
-		Email:         os.Getenv("GMAIL_EMAIL"),
-		Password:      os.Getenv("GMAIL_PASSWORD"),
-		BackupDir:     getenv("BACKUP_DIR", "./backups"),
-		ImapServer:    getenv("IMAP_SERVER", "imap.gmail.com"),
-		ImapPort:      getenvInt("IMAP_PORT", 993),
-		FoldersOnly:   folders,
-		MaxWorkers:    getenvInt("MAX_WORKERS", 1), // Single worker
-		DryRun:        getenvBool("DRY_RUN", false),
-		TLSSkipVerify: getenvBool("TLS_SKIP_VERIFY", false),
-		LogLevel:      getenv("LOG_LEVEL", "INFO"),
+		Email:           os.Getenv("GMAIL_EMAIL"),
+		Password:        os.Getenv("GMAIL_PASSWORD"),
+		BackupDir:       getenv("BACKUP_DIR", "./backups"),
+		ImapServer:      getenv("IMAP_SERVER", "imap.gmail.com"),
+		ImapPort:        getenvInt("IMAP_PORT", 993),
+		FoldersOnly:     folders,
+		MaxWorkers:      getenvInt("MAX_WORKERS", 1), // Single worker
+		DryRun:          getenvBool("DRY_RUN", false),
+		TLSSkipVerify:   getenvBool("TLS_SKIP_VERIFY", false),
+		LogLevel:        getenv("LOG_LEVEL", "INFO"),
+		ClientID:        getenv("GMAIL_CLIENT_ID", ""),
+		ClientSecret:    getenv("GMAIL_CLIENT_SECRET", ""),
+		OAuth2TokenFile: getenv("OAUTH2_TOKEN_FILE", ""),
 	}
 }

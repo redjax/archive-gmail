@@ -3,8 +3,11 @@ package gmailservice
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,9 +16,12 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-sasl"
 	config "github.com/redjax/archive-gmail/internal/config"
 	"github.com/redjax/archive-gmail/internal/utils"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
 
 func DrainChannel[T any](ch <-chan T, maxWait time.Duration) {
@@ -65,7 +71,6 @@ func ListMailboxes(c *client.Client) ([]string, error) {
 
 func MailboxDir(base, box string) string {
 	safe := strings.ReplaceAll(box, "/", "_")
-
 	return filepath.Join(base, safe)
 }
 
@@ -75,7 +80,6 @@ func MessagePath(base, box string, msgID uint64) string {
 
 func Connect(cfg config.Config) (*client.Client, error) {
 	addr := fmt.Sprintf("%s:%d", cfg.ImapServer, cfg.ImapPort)
-
 	tlsCfg := &tls.Config{
 		ServerName:         cfg.ImapServer,
 		InsecureSkipVerify: cfg.TLSSkipVerify,
@@ -85,9 +89,23 @@ func Connect(cfg config.Config) (*client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			c.Close()
+		}
+	}()
 
-	c.Timeout = 5 * time.Minute // Reduced for faster failure detection
+	c.Timeout = 5 * time.Minute
 
+	if cfg.ClientID != "" && cfg.ClientSecret != "" {
+		logrus.Info("Using OAuth2")
+		if err := authenticateOAuth2(c, cfg); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+
+	logrus.Info("Using app password")
 	if err := c.Login(cfg.Email, cfg.Password); err != nil {
 		return nil, err
 	}
@@ -98,7 +116,6 @@ func Connect(cfg config.Config) (*client.Client, error) {
 func ProcessMailbox(c *client.Client, box string, cfg config.Config, downloaded *uint64, mu *sync.RWMutex) {
 	logrus.Infof("Processing: %s", box)
 
-	// Robust SELECT with retries
 	var mboxStatus *imap.MailboxStatus
 	var selectErr error
 	for retry := 0; retry < 3; retry++ {
@@ -106,41 +123,30 @@ func ProcessMailbox(c *client.Client, box string, cfg config.Config, downloaded 
 		if selectErr == nil {
 			break
 		}
-		logrus.Warnf("SELECT %s failed (attempt %d/3): %v", box, retry+1, selectErr)
-		if retry < 2 {
-			time.Sleep(time.Duration(retry+1) * time.Second)
-		}
+		time.Sleep(time.Duration(retry+1) * time.Second)
 	}
 
 	if selectErr != nil || mboxStatus == nil || mboxStatus.Messages == 0 {
-		logrus.Infof("  Skipping %s: empty or SELECT failed", box)
 		return
 	}
-
-	logrus.Infof("%s: %d total messages (UID range 1-%d)", box, mboxStatus.Messages, mboxStatus.UidNext-1)
 
 	if err := utils.EnsureDir(MailboxDir(cfg.BackupDir, box), cfg.DryRun); err != nil {
-		logrus.Warnf("Failed to create dir for %s: %v", box, err)
 		return
 	}
-
-	// Get all existing UIDs in single command
-	logrus.Infof("%s: Fetching all %d UIDs (one-shot)", box, mboxStatus.Messages)
 
 	uidSeq := new(imap.SeqSet)
 	uidSeq.AddRange(1, mboxStatus.UidNext-1)
 	uidMsgs := make(chan *imap.Message, 1000)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	fetchErr := make(chan error, 1)
+	defer cancel()
 
+	fetchErr := make(chan error, 1)
 	go func() {
 		fetchErr <- c.UidFetch(uidSeq, []imap.FetchItem{imap.FetchUid}, uidMsgs)
 	}()
 
-	missingUIDs := make([]uint32, 0, mboxStatus.Messages/10)
-	msgCount := 0
-	missingCount := 0
+	missingUIDs := make([]uint32, 0)
 
 loop:
 	for {
@@ -149,103 +155,128 @@ loop:
 			if !ok {
 				break loop
 			}
-			msgCount++
 			path := MessagePath(cfg.BackupDir, box, uint64(msg.Uid))
 			if !utils.Exists(path) {
 				missingUIDs = append(missingUIDs, msg.Uid)
-				missingCount++
 			}
-		case err := <-fetchErr:
-			if err != nil {
-				logrus.Warnf("  [%s] UID FETCH failed: %v", box, err)
-			}
+		case <-fetchErr:
 			DrainChannel(uidMsgs, 5*time.Second)
 			break loop
 		case <-ctx.Done():
-			logrus.Warnf("  [%s] UID FETCH timeout after %d msgs", box, msgCount)
 			DrainChannel(uidMsgs, 5*time.Second)
 			break loop
 		}
 	}
 
-	cancel()
-	logrus.Infof("%s: Scanned %d/%d UIDs, found %d missing", box, msgCount, mboxStatus.Messages, len(missingUIDs))
-
-	if len(missingUIDs) == 0 {
-		logrus.Infof("%s: Nothing new to download (%d total)", box, mboxStatus.Messages)
-		return
-	}
-
-	logrus.Infof("%s: Downloading %d missing messages", box, len(missingUIDs))
-
-	// Download missing messages
-	savedCount := 0
-	for i, uid := range missingUIDs {
-		if i%20 == 0 && i > 0 {
-			pct := 100 * float64(i) / float64(len(missingUIDs))
-			logrus.Infof("  [%s] Downloading %d/%d (%.0f%%)", box, i, len(missingUIDs), pct)
-		}
-
-		// Single message fetch with timeout
+	for _, uid := range missingUIDs {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
 
 		seq := new(imap.SeqSet)
 		seq.AddNum(uid)
 		section := &imap.BodySectionName{Peek: true}
-		items := []imap.FetchItem{section.FetchItem()}
 		msgs := make(chan *imap.Message, 1)
 
-		fetchErr := make(chan error, 1)
 		go func() {
-			fetchErr <- c.UidFetch(seq, items, msgs)
+			_ = c.UidFetch(seq, []imap.FetchItem{section.FetchItem()}, msgs)
 		}()
 
 		select {
-		case err := <-fetchErr:
-			if err != nil {
-				logrus.Debugf("[%s] Failed UID %d: %v", box, uid, err)
-				DrainChannel(msgs, 1*time.Second)
-				continue
+		case msg := <-msgs:
+			if msg == nil {
+				break
+			}
+			body := msg.GetBody(section)
+			if body == nil {
+				break
+			}
+			data, err := io.ReadAll(body)
+			if err == nil && !cfg.DryRun {
+				path := MessagePath(cfg.BackupDir, box, uint64(uid))
+				_ = os.WriteFile(path, data, 0644)
+				mu.Lock()
+				*downloaded++
+				mu.Unlock()
 			}
 		case <-ctx.Done():
-			logrus.Debugf("[%s] Timeout UID %d", box, uid)
-			continue
 		}
 
-		msg := <-msgs
-		if msg == nil {
-			continue
-		}
+		cancel()
+		time.Sleep(50 * time.Millisecond)
+	}
+}
 
-		body := msg.GetBody(section)
-		if body == nil {
-			continue
-		}
-
-		data, err := io.ReadAll(body)
-		if err != nil {
-			logrus.Debugf("[%s] Read failed UID %d: %v", box, uid, err)
-			continue
-		}
-
-		path := MessagePath(cfg.BackupDir, box, uint64(uid))
-		if cfg.DryRun {
-			continue
-		}
-
-		if err := os.WriteFile(path, data, 0644); err != nil {
-			logrus.Debugf("[%s] Write failed %s: %v", box, path, err)
-			continue
-		}
-
-		savedCount++
-		mu.Lock()
-		*downloaded++
-		mu.Unlock()
-
-		time.Sleep(50 * time.Millisecond) // Gmail politeness
+func authenticateOAuth2(c *client.Client, cfg config.Config) error {
+	token, err := getValidOAuth2Token(cfg)
+	if err != nil {
+		return err
 	}
 
-	logrus.Infof("%s COMPLETE: %d/%d saved", box, savedCount, len(missingUIDs))
+	saslClient := sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{
+		Username: cfg.Email,
+		Token:    token.AccessToken,
+	})
+
+	if err := c.Authenticate(saslClient); err != nil {
+		return fmt.Errorf("OAuth2 IMAP auth failed: %w", err)
+	}
+
+	logrus.Info("OAuth2 IMAP authentication successful")
+	return nil
+}
+
+func getValidOAuth2Token(cfg config.Config) (*oauth2.Token, error) {
+	if cfg.OAuth2TokenFile != "" {
+		token, err := loadTokenFromFile(cfg.OAuth2TokenFile)
+		if err == nil && token.Valid() {
+			return token, nil
+		}
+	}
+
+	conf := &oauth2.Config{
+		ClientID:     cfg.ClientID,
+		ClientSecret: cfg.ClientSecret,
+		Scopes:       []string{"https://mail.google.com/"},
+		RedirectURL:  "http://localhost",
+		Endpoint:     google.Endpoint,
+	}
+
+	authURL := conf.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
+	fmt.Printf("Open this URL in a browser:\n%s\n\nAfter finishing authentication, copy the value in &code=... and paste it below.\nEnter code: ", authURL)
+
+	var raw string
+	fmt.Scanln(&raw)
+
+	code, err := url.QueryUnescape(raw)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx := context.Background()
+	token, err := conf.Exchange(ctx, code)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if cfg.OAuth2TokenFile != "" {
+		_ = saveTokenToFile(cfg.OAuth2TokenFile, token)
+	}
+
+	return token, nil
+}
+
+func loadTokenFromFile(filename string) (*oauth2.Token, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	token := new(oauth2.Token)
+	return token, json.Unmarshal(data, token)
+}
+
+func saveTokenToFile(filename string, token *oauth2.Token) error {
+	data, err := json.MarshalIndent(token, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filename, data, 0600)
 }
