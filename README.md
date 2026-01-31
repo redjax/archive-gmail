@@ -8,7 +8,11 @@ Little Go app for local archive of Gmail mailbox. Connects to Gmail via IMAP and
 - [Setup](#setup)
 - [Build](#build)
 - [Install](#install)
-- [OAuth Setup](#oauth-setup)
+- [Authenticate using OAuth2](#authenticate-using-oauth2)
+- [OAuth2 client setup](#oauth2-client-setup)
+- [Env vars](#env-vars)
+- [Authenticate](#authenticate)
+- [Docker](#docker)
 
 ## Requirements
 
@@ -49,10 +53,13 @@ Place the [binary you built to `dist/archive-gmail[.exe]`](#build) somewhere in 
 export PATH="$PATH:$HOME/.local/bin"
 ```
 
-## OAuth Setup
+## Authenticate using OAuth2
 
-> [!WARNING]
-> OAuth2 is not implemented yet
+You can (and should) authenticate the CLI with OAuth2. First you must setup an OAuth2 client app in Google Cloud, then authenticate the CLI to get a token. After doing this setup the first time, the app will handle refreshing the token.
+
+There is [a separate app](./cmd/authenticate/main.go) to handle authenticating. This app simply logs in with the OAuth2 client and gets a token, or refreshes it.
+
+## OAuth2 client setup
 
 *[Google OAuth client ID & secret](https://developers.google.com/identity/protocols/oauth2)*
 
@@ -93,3 +100,66 @@ export PATH="$PATH:$HOME/.local/bin"
   - Go to [Auth Audience](https://console.cloud.google.com/auth/audience)
   - Click on Publish app
 - Once your application is approved and verified it will start showing your application name on the authorization consent screen. Until then it will be showing the 'unified.to' name, which is inferred from the redirect URL
+
+## Env vars
+
+If you're using `direnv`, create a  `.envrc.local` and paste your OAuth2 client ID and secret:
+
+```text
+# .envrc.local
+
+export GMAIL_EMAIL="jackenyon@gmail.com"
+## Leave this empty or remove it completely when using OAuth2
+export GMAIL_PASSWORD=
+
+## Set OAuth2 client ID and secret
+export GMAIL_CLIENT_ID=<OAuth2 client ID>
+export GMAIL_CLIENT_SECRET=<OAuth2 client secret>
+
+export BACKUP_DIR="mailbox"
+export DRY_RUN="false"
+## Example: INBOX,[Gmail]/All Mail
+export FOLDERS_ONLY=""
+export MAX_WORKERS=1
+export LOG_LEVEL=INFO
+
+```
+
+## Authenticate
+
+The first time you run the app, if no token file is found it will walk you through the auth flow. You can also run the [`archive-gmail-auth` CLI](./cmd/authenticate/main.go), which exits immediately after finishing authentication.
+
+When you run the app or auth CLI, you will see a URL that you should open in your browser. This will walk you through a Google SSO login, and will redirect to an invalid `http://localhost` URL. Inspect the URL and copy the code in the `&code=...` parameter. Paste that into the CLI and a `token.json` file will be saved on your machine. You are now authenticated and do not have to do this again as long as the `token.json` file exists.
+
+When the app runs, it will automatically refresh the token when required.
+
+## Docker
+
+Before starting, copy `.containers/.env.example` to `.containers/.env`. Edit the file, setting your email account and OAuth2 client ID and secret (or app password).
+
+```text
+## Default: golang:1.25-alpine
+GO_CONTAINER_IMG=
+## Default: alpine:latest
+GO_RUNTIME_IMG=
+
+GMAIL_EMAIL="your-email@gmail.com"
+GMAIL_PASSWORD="xxxx xxxx xxxx xxxx"
+## OAuth2 (remove values if using app password)
+GMAIL_CLIENT_ID=<OAuth2 client ID>
+GMAIL_CLIENT_SECRET=<OAuth2 client secret>
+
+HOST_BACKUP_DIR="/path/to/archive_gmail/mailbox"
+DRY_RUN="false"
+## Example: INBOX,[Gmail]/All Mail
+FOLDERS_ONLY=""
+MAX_WORKERS=1
+LOG_LEVEL=INFO
+
+TOKEN_FILE=./token
+
+```
+
+There are Docker containers and a `compose.yml` in the [`.containers/` directory](./.containers). If you are using OAuth2 and have not [authenticated](#authenticate) yet, run the [`get_auth_token.sh` script](./scripts/containers/get_auth_token.sh). This will build and run the auth CLI in a container, and persist the token in `.containers/token/token.json`. The [`compose.yml`](./.containers/compose.yml) expects this path to exist and a `token.json` to exist.
+
+After authenticating (if using OAuth2) or pasting your app password in the `.env` file, you can run the container with the [`start_compose.sh` script](./scripts/containers/start_compose.sh).
