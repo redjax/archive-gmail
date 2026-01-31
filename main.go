@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -87,13 +88,34 @@ func connect(cfg Config) (*client.Client, error) {
 		return nil, err
 	}
 
-	c.Timeout = 5 * time.Minute
+	c.Timeout = 5 * time.Minute // Reduced for faster failure detection
 
 	if err := c.Login(cfg.Email, cfg.Password); err != nil {
 		return nil, err
 	}
 
 	return c, nil
+}
+
+func drainChannel[T any](ch <-chan T, maxWait time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), maxWait)
+	defer cancel()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		case <-ticker.C:
+			// Continue waiting
+		}
+	}
 }
 
 func listMailboxes(c *client.Client) ([]string, error) {
@@ -117,6 +139,7 @@ func listMailboxes(c *client.Client) ([]string, error) {
 			boxes = append(boxes, m.Name)
 		}
 	}
+
 	return boxes, <-done
 }
 
@@ -144,6 +167,7 @@ func exists(path string) bool {
 func processMailbox(c *client.Client, box string, cfg Config, downloaded *uint64, mu *sync.RWMutex) {
 	logrus.Infof("Processing: %s", box)
 
+	// Robust SELECT with retries
 	var mboxStatus *imap.MailboxStatus
 	var selectErr error
 	for retry := 0; retry < 3; retry++ {
@@ -169,85 +193,99 @@ func processMailbox(c *client.Client, box string, cfg Config, downloaded *uint64
 		return
 	}
 
-	logrus.Infof("Scanning UIDs for %s (%d messages)", box, mboxStatus.Messages)
-
+	// Smaller chunks for Gmail stability
+	chunkSize := uint32(50)
 	missingUIDs := make([]uint32, 0, mboxStatus.Messages/10)
-	chunkSize := uint32(2000)
-	totalChunks := (mboxStatus.UidNext + chunkSize - 1) / chunkSize
 
-	scanStart := time.Now()
+	// Scan for missing messages with timeout protection
 	for chunkStart := uint32(1); chunkStart < mboxStatus.UidNext; chunkStart += chunkSize {
 		chunkEnd := chunkStart + chunkSize - 1
-		if chunkEnd > mboxStatus.UidNext {
-			chunkEnd = mboxStatus.UidNext
+		if chunkEnd >= mboxStatus.UidNext {
+			chunkEnd = mboxStatus.UidNext - 1
 		}
 
 		shortBox := box
 		if len(box) > 20 {
 			shortBox = box[:20]
 		}
+
 		chunkNum := (chunkStart-1)/chunkSize + 1
+		totalChunks := (mboxStatus.UidNext + chunkSize - 1) / chunkSize
 		pct := int(100 * float64(chunkStart) / float64(mboxStatus.UidNext))
-		logrus.Infof("[%s] Chunk %d/%d (UIDs %d-%d) %d%%",
-			shortBox, chunkNum, totalChunks, chunkStart, chunkEnd, pct)
+		logrus.Infof("[%s] Chunk %d/%d (UIDs %d-%d) %d%%", shortBox, chunkNum, totalChunks, chunkStart, chunkEnd, pct)
 
 		uidSeq := new(imap.SeqSet)
 		uidSeq.AddRange(chunkStart, chunkEnd)
-		uidMsgs := make(chan *imap.Message, 200)
+		uidMsgs := make(chan *imap.Message, 100)
 
-		if err := c.UidFetch(uidSeq, []imap.FetchItem{imap.FetchUid}, uidMsgs); err != nil {
-			logrus.Warnf("└─ Chunk %d-%d failed: %v", chunkStart, chunkEnd, err)
-			continue
-		}
+		// Fetch UIDs with timeout protection
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		fetchErr := make(chan error, 1)
+
+		go func() {
+			fetchErr <- c.UidFetch(uidSeq, []imap.FetchItem{imap.FetchUid}, uidMsgs)
+		}()
 
 		chunkMissing := 0
-		for msg := range uidMsgs {
-			path := messagePath(cfg.BackupDir, box, uint64(msg.Uid))
-			if !exists(path) {
-				missingUIDs = append(missingUIDs, msg.Uid)
-				chunkMissing++
+		msgCount := 0
+
+		// Drain channel with timeout
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+	loop:
+		for {
+			select {
+			case msg, ok := <-uidMsgs:
+				if !ok {
+					break loop
+				}
+				msgCount++
+				path := messagePath(cfg.BackupDir, box, uint64(msg.Uid))
+				if !exists(path) {
+					missingUIDs = append(missingUIDs, msg.Uid)
+					chunkMissing++
+				}
+			case err := <-fetchErr:
+				if err != nil {
+					logrus.Warnf("  └─ Chunk %d-%d FAILED: %v", chunkStart, chunkEnd, err)
+				}
+				drainChannel(uidMsgs, 2*time.Second) // Drain any remaining
+				break loop
+			case <-ctx.Done():
+				logrus.Warnf("  └─ Chunk %d-%d TIMEOUT", chunkStart, chunkEnd)
+				drainChannel(uidMsgs, 1*time.Second)
+				break loop
+			case <-ticker.C:
+				// Continue
 			}
 		}
 
-		if chunkNum%5 == 0 || chunkNum == totalChunks {
-			scanElapsed := time.Since(scanStart).Seconds()
-			remainingChunks := totalChunks - chunkNum
-			eta := scanElapsed * float64(remainingChunks) / float64(chunkNum)
-			logrus.Infof("Scan progress: %d/%d chunks, %d missing so far (ETA: %.0fs)",
-				chunkNum, totalChunks, len(missingUIDs), eta)
-		}
+		cancel()
+		logrus.Infof("  └─ Chunk %d-%d: %d missing / %d checked", chunkStart, chunkEnd, chunkMissing, msgCount)
+
+		// Gmail politeness delay
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	scanElapsed := time.Since(scanStart).Seconds()
-	pctMissing := 100 * float64(len(missingUIDs)) / float64(mboxStatus.Messages)
-	logrus.Infof("Scan complete: %.1fs, found %d missing / %.1f%% of %d total",
-		scanElapsed, len(missingUIDs), pctMissing, mboxStatus.Messages)
-
 	if len(missingUIDs) == 0 {
-		logrus.Infof("%s: Nothing new to download", box)
+		logrus.Infof("%s: Nothing new to download (%d total)", box, mboxStatus.Messages)
 		return
 	}
 
-	// Download with progress
-	logrus.Infof("  Downloading %d messages from %s", len(missingUIDs), box)
+	logrus.Infof("%s: Found %d missing messages - downloading...", box, len(missingUIDs))
 
-	downloadStart := time.Now()
+	// Download missing messages
 	savedCount := 0
-
 	for i, uid := range missingUIDs {
-		// Progress every 100 messages
-		if i > 0 && i%100 == 0 {
+		if i%20 == 0 && i > 0 {
 			pct := 100 * float64(i) / float64(len(missingUIDs))
-			elapsed := time.Since(downloadStart).Seconds()
-			rate := float64(i) / elapsed
-			eta := elapsed * float64(len(missingUIDs)-i) / float64(i)
-			shortBox := box
-			if len(box) > 20 {
-				shortBox = box[:20]
-			}
-			logrus.Infof("⬇️  [%s] %d/%d (%.1f%%, %.0f msg/s, ETA: %.0fs)",
-				shortBox, i, len(missingUIDs), pct, rate, eta)
+			logrus.Infof("  Downloading %d/%d (%.0f%%)", i, len(missingUIDs), pct)
 		}
+
+		// Single message fetch with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
 
 		seq := new(imap.SeqSet)
 		seq.AddNum(uid)
@@ -255,8 +293,20 @@ func processMailbox(c *client.Client, box string, cfg Config, downloaded *uint64
 		items := []imap.FetchItem{section.FetchItem()}
 		msgs := make(chan *imap.Message, 1)
 
-		if err := c.UidFetch(seq, items, msgs); err != nil {
-			logrus.Debugf("Fetch failed UID %d: %v", uid, err)
+		fetchErr := make(chan error, 1)
+		go func() {
+			fetchErr <- c.UidFetch(seq, items, msgs)
+		}()
+
+		select {
+		case err := <-fetchErr:
+			if err != nil {
+				logrus.Debugf("Failed UID %d: %v", uid, err)
+				drainChannel(msgs, 1*time.Second)
+				continue
+			}
+		case <-ctx.Done():
+			logrus.Debugf("Timeout UID %d", uid)
 			continue
 		}
 
@@ -290,11 +340,12 @@ func processMailbox(c *client.Client, box string, cfg Config, downloaded *uint64
 		mu.Lock()
 		*downloaded++
 		mu.Unlock()
+
+		// Per-message Gmail politeness
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	downloadElapsed := time.Since(downloadStart).Seconds()
-	logrus.Infof("%s COMPLETE: %d/%d saved (%.1f msg/s)",
-		box, savedCount, len(missingUIDs), float64(savedCount)/downloadElapsed)
+	logrus.Infof("%s COMPLETE: %d/%d saved", box, savedCount, len(missingUIDs))
 }
 
 func main() {
@@ -322,7 +373,6 @@ func main() {
 	var downloaded uint64
 	mu := sync.RWMutex{}
 
-	// Parallel processing using workers
 	sem := make(chan struct{}, cfg.MaxWorkers)
 	var wg sync.WaitGroup
 
@@ -333,14 +383,12 @@ func main() {
 			continue
 		}
 
-		// Wait for available worker slot
 		sem <- struct{}{}
 		wg.Add(1)
 
 		go func(boxName string) {
 			defer wg.Done()
-			defer func() { <-sem }() // Release worker slot
-
+			defer func() { <-sem }()
 			processMailbox(c, boxName, cfg, &downloaded, &mu)
 		}(box)
 	}
@@ -348,11 +396,6 @@ func main() {
 	wg.Wait()
 
 	elapsed := time.Since(start).Seconds()
-	if elapsed > 0 {
-		rate := float64(downloaded) / elapsed
-		logrus.Infof("Archive complete: %d messages in %.1fs (%.2f msg/sec)",
-			downloaded, elapsed, rate)
-	} else {
-		logrus.Info("Archive complete")
-	}
+	rate := float64(downloaded) / elapsed
+	logrus.Infof("Archive complete: %d messages in %.1fs (%.2f msg/sec)", downloaded, elapsed, rate)
 }
