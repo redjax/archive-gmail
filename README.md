@@ -129,7 +129,13 @@ export LOG_LEVEL=INFO
 
 The first time you run the app, if no token file is found it will walk you through the auth flow. You can also run the [`archive-gmail-auth` CLI](./cmd/authenticate/main.go), which exits immediately after finishing authentication.
 
-When you run the app or auth CLI, you will see a URL that you should open in your browser. This will walk you through a Google SSO login, and will redirect to an invalid `http://localhost` URL. Inspect the URL and copy the code in the `&code=...` parameter. Paste that into the CLI and a `token.json` file will be saved on your machine. You are now authenticated and do not have to do this again as long as the `token.json` file exists.
+When you run the app or auth CLI, you will see a URL that you should open in your browser. This will walk you through a Google SSO login, and will redirect to an invalid `http://localhost` URL like:
+
+```text
+http://localhost/?state=state-toke&code=<TOKEN YOU NEED TO COPY>&scope=https://mail.google.com/
+```
+
+Inspect the URL and copy the code in the `&code=...` parameter. Paste that into the CLI and a `token.json` file will be saved on your machine. You are now authenticated and do not have to do this again as long as the `token.json` file exists.
 
 When the app runs, it will automatically refresh the token when required.
 
