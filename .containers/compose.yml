@@ -1,0 +1,22 @@
+---
+name: archive-gmail
+
+volumes:
+  archive-gmail_mailbox: {}
+
+services:
+  archive-gmail:
+    image: archive-gmail:latest
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: .containers/Dockerfile
+      args:
+        GO_CONTAINER_IMG: ${GO_CONTAINER_IMG:-golang:1.25-alpine}
+        RUNTIME_IMG: ${GO_RUNTIME_IMG:-alpine:latest}
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    volumes:
+      - ${BACKUP_DIR:-archive-gmail_mailbox}:/app/backups
