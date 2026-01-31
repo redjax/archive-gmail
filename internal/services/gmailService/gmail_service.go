@@ -1,4 +1,4 @@
-package gmailservice
+package gmailService
 
 import (
 	"context"
@@ -15,13 +15,15 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
-	config "github.com/redjax/archive-gmail/internal/config"
-	"github.com/redjax/archive-gmail/internal/utils"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+
+	config "github.com/redjax/archive-gmail/internal/config"
+	"github.com/redjax/archive-gmail/internal/utils"
 )
 
+// DrainChannel drains a channel for up to maxWait
 func DrainChannel[T any](ch <-chan T, maxWait time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), maxWait)
 	defer cancel()
@@ -42,13 +44,12 @@ func DrainChannel[T any](ch <-chan T, maxWait time.Duration) {
 	}
 }
 
+// ListMailboxes returns all selectable mailboxes
 func ListMailboxes(c *client.Client) ([]string, error) {
 	ch := make(chan *imap.MailboxInfo, 50)
 	done := make(chan error, 1)
 
-	go func() {
-		done <- c.List("", "*", ch)
-	}()
+	go func() { done <- c.List("", "*", ch) }()
 
 	var boxes []string
 	for m := range ch {
@@ -67,15 +68,18 @@ func ListMailboxes(c *client.Client) ([]string, error) {
 	return boxes, <-done
 }
 
+// MailboxDir returns the filesystem-safe path for a mailbox
 func MailboxDir(base, box string) string {
 	safe := strings.ReplaceAll(box, "/", "_")
 	return filepath.Join(base, safe)
 }
 
+// MessagePath returns the path for a message file
 func MessagePath(base, box string, msgID uint64) string {
 	return filepath.Join(MailboxDir(base, box), fmt.Sprintf("%d.eml", msgID))
 }
 
+// Connect connects to IMAP using either password or OAuth2
 func Connect(cfg config.Config) (*client.Client, error) {
 	addr := fmt.Sprintf("%s:%d", cfg.ImapServer, cfg.ImapPort)
 	tlsCfg := &tls.Config{
@@ -111,6 +115,7 @@ func Connect(cfg config.Config) (*client.Client, error) {
 	return c, nil
 }
 
+// ProcessMailbox downloads missing messages from a mailbox
 func ProcessMailbox(c *client.Client, box string, cfg config.Config, downloaded *uint64, mu *sync.RWMutex) {
 	logrus.Infof("Processing: %s", box)
 
@@ -125,10 +130,12 @@ func ProcessMailbox(c *client.Client, box string, cfg config.Config, downloaded 
 	}
 
 	if selectErr != nil || mboxStatus == nil || mboxStatus.Messages == 0 {
+		logrus.Infof("Skipping mailbox %s: empty or select failed", box)
 		return
 	}
 
 	if err := utils.EnsureDir(MailboxDir(cfg.BackupDir, box), cfg.DryRun); err != nil {
+		logrus.Warnf("Failed to create mailbox dir: %v", err)
 		return
 	}
 
@@ -140,12 +147,9 @@ func ProcessMailbox(c *client.Client, box string, cfg config.Config, downloaded 
 	defer cancel()
 
 	fetchErr := make(chan error, 1)
-	go func() {
-		fetchErr <- c.UidFetch(uidSeq, []imap.FetchItem{imap.FetchUid}, uidMsgs)
-	}()
+	go func() { fetchErr <- c.UidFetch(uidSeq, []imap.FetchItem{imap.FetchUid}, uidMsgs) }()
 
 	missingUIDs := make([]uint32, 0)
-
 loop:
 	for {
 		select {
@@ -174,9 +178,7 @@ loop:
 		section := &imap.BodySectionName{Peek: true}
 		msgs := make(chan *imap.Message, 1)
 
-		go func() {
-			_ = c.UidFetch(seq, []imap.FetchItem{section.FetchItem()}, msgs)
-		}()
+		go func() { _ = c.UidFetch(seq, []imap.FetchItem{section.FetchItem()}, msgs) }()
 
 		select {
 		case msg := <-msgs:
@@ -203,14 +205,17 @@ loop:
 	}
 }
 
+// ----------------------
+// OAuth2 + Token Handling
+// ----------------------
+
 func authenticateOAuth2(c *client.Client, cfg config.Config) error {
 	if cfg.OAuth2TokenFile == "" {
 		return fmt.Errorf("OAUTH2_TOKEN_FILE is not set")
 	}
 
-	// Ensure directory exists for token file
-	dir := filepath.Dir(cfg.OAuth2TokenFile)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(cfg.OAuth2TokenFile), 0700); err != nil {
 		return fmt.Errorf("cannot create token dir: %w", err)
 	}
 
@@ -223,25 +228,18 @@ func authenticateOAuth2(c *client.Client, cfg config.Config) error {
 	}
 
 	ctx := context.Background()
-	var token *oauth2.Token
 
-	// Load cached token
+	var token *oauth2.Token
 	if t, err := loadTokenFromFile(cfg.OAuth2TokenFile); err == nil && t.Valid() {
 		logrus.Infof("Loaded cached token from %s", cfg.OAuth2TokenFile)
 		token = t
-	} else if err != nil {
-		logrus.Infof("No valid cached token found: %v", err)
 	}
 
 	// First-time login
 	if token == nil || !token.Valid() {
-		authURL := conf.AuthCodeURL(
-			"state",
-			oauth2.AccessTypeOffline,
-			oauth2.SetAuthURLParam("prompt", "consent"),
-		)
+		authURL := conf.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
+		fmt.Printf("Open this URL in a browser:\n%s\n\nCopy the code below:\nEnter code: ", authURL)
 
-		fmt.Printf("Open this URL in a browser:\n%s\n\nAfter finishing authentication, copy the code below:\nEnter code: ", authURL)
 		var rawCode string
 		fmt.Scanln(&rawCode)
 
@@ -263,23 +261,21 @@ func authenticateOAuth2(c *client.Client, cfg config.Config) error {
 		}
 	}
 
-	// TokenSource handles automatic refresh
+	// TokenSource auto-refresh
 	ts := conf.TokenSource(ctx, token)
 
-	// Wrap in a function to fetch fresh access token right before IMAP auth
 	getAccessToken := func() (string, error) {
 		tok, err := ts.Token()
 		if err != nil {
 			return "", fmt.Errorf("failed to refresh token: %w", err)
 		}
-		// Save refreshed token back to disk
 		if err := saveTokenToFile(cfg.OAuth2TokenFile, tok); err != nil {
 			logrus.Warnf("Failed to save refreshed token: %v", err)
 		}
 		return tok.AccessToken, nil
 	}
 
-	// IMAP XOAUTH2 SASL client
+	// SASL XOAUTH2 client
 	saslClient := &SASLOAuth2Client{
 		Username: cfg.Email,
 		TokenFn:  getAccessToken,
@@ -293,7 +289,7 @@ func authenticateOAuth2(c *client.Client, cfg config.Config) error {
 	return nil
 }
 
-// SASLOAuth2Client implements go-sasl.Client with dynamic token fetching
+// SASLOAuth2Client implements go-sasl.Client for Gmail
 type SASLOAuth2Client struct {
 	Username string
 	TokenFn  func() (string, error)
@@ -305,12 +301,11 @@ func (c *SASLOAuth2Client) Start() (mech string, ir []byte, err error) {
 	if err != nil {
 		return "", nil, err
 	}
-	// Gmail XOAUTH2 payload: "user=<email>\x01auth=Bearer <access_token>\x01\x01"
 	payload := fmt.Sprintf("user=%s\x01auth=Bearer %s\x01\x01", c.Username, token)
 	return "XOAUTH2", []byte(payload), nil
 }
 
-func (c *SASLOAuth2Client) Next(challenge []byte) (response []byte, err error) {
+func (c *SASLOAuth2Client) Next(challenge []byte) ([]byte, error) {
 	if c.stepDone {
 		return nil, io.EOF
 	}
@@ -322,91 +317,14 @@ func (c *SASLOAuth2Client) Completed() bool {
 	return c.stepDone
 }
 
-func getValidOAuth2Token(cfg config.Config) (*oauth2.Token, error) {
-	conf := &oauth2.Config{
-		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
-		Scopes:       []string{"https://mail.google.com/"},
-		RedirectURL:  "http://localhost",
-		Endpoint:     google.Endpoint,
-	}
-
-	ctx := context.Background()
-	var token *oauth2.Token
-
-	// Ensure directory exists for token file
-	if cfg.OAuth2TokenFile != "" {
-		dir := filepath.Dir(cfg.OAuth2TokenFile)
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return nil, fmt.Errorf("cannot create token dir: %w", err)
-		}
-
-		// Try loading existing token
-		if t, err := loadTokenFromFile(cfg.OAuth2TokenFile); err == nil && t.Valid() {
-			logrus.Info("Loaded cached OAuth2 token")
-			token = t
-		} else if err != nil {
-			logrus.Warnf("Failed to load token file: %v", err)
-		}
-	}
-
-	// First-time login
-	if token == nil || !token.Valid() {
-		authURL := conf.AuthCodeURL(
-			"state",
-			oauth2.AccessTypeOffline,
-			oauth2.SetAuthURLParam("prompt", "consent"),
-		)
-		fmt.Printf("Open this URL in a browser:\n%s\n\nAfter finishing authentication, copy the code below:\nEnter code: ", authURL)
-
-		var code string
-		fmt.Scanln(&code)
-
-		// URL-decode in case user copy-pastes escaped code
-		code, err := url.QueryUnescape(code)
-		if err != nil {
-			return nil, fmt.Errorf("invalid auth code: %w", err)
-		}
-
-		tok, err := conf.Exchange(ctx, code)
-		if err != nil {
-			return nil, fmt.Errorf("OAuth2 code exchange failed: %w", err)
-		}
-		token = tok
-
-		if cfg.OAuth2TokenFile != "" {
-			if err := saveTokenToFile(cfg.OAuth2TokenFile, token); err != nil {
-				logrus.Warnf("Failed to save token: %v", err)
-			} else {
-				logrus.Infof("Saved token to %s", cfg.OAuth2TokenFile)
-			}
-		}
-	}
-
-	// Always use TokenSource to refresh expired access tokens automatically
-	ts := conf.TokenSource(ctx, token)
-	newToken, err := ts.Token()
-	if err != nil {
-		return nil, fmt.Errorf("token refresh failed: %w", err)
-	}
-
-	// Save refreshed token
-	if cfg.OAuth2TokenFile != "" {
-		if err := saveTokenToFile(cfg.OAuth2TokenFile, newToken); err != nil {
-			logrus.Warnf("Failed to save refreshed token: %v", err)
-		}
-	}
-
-	return newToken, nil
-}
-
+// Token file helpers
 func loadTokenFromFile(filename string) (*oauth2.Token, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
-	token := new(oauth2.Token)
-	return token, json.Unmarshal(data, token)
+	var token oauth2.Token
+	return &token, json.Unmarshal(data, &token)
 }
 
 func saveTokenToFile(filename string, token *oauth2.Token) error {

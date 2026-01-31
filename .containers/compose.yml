@@ -18,5 +18,8 @@ services:
     tty: true
     env_file:
       - .env
+    environment:
+      OAUTH2_TOKEN_FILE: /app/config/token.json
     volumes:
       - ${HOST_BACKUP_DIR:-archive-gmail_mailbox}:/app/backups
+      - ./token:/app/config

@@ -9,6 +9,8 @@ dist/
 
 *.eml
 
+token.json
+
 !*example*.*
 !*.*example*
 !scripts/
