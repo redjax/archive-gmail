@@ -1,0 +1,11 @@
+build/
+dist/
+
+*.log
+*.log.*
+
+.env
+.envrc.local
+
+!*example*.*
+!*.*example*
