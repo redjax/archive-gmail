@@ -9,10 +9,31 @@ before:
     - go test ./... -v
 
 builds:
-  - env:
+  ## Main app
+  - id: archive-gmail
+    env:
       - CGO_ENABLED=0
     main: ./cmd/archive-gmail
     binary: archive-gmail
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.Commit={{.Commit}}
+      - -X main.Date={{ .CommitDate }}
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+  ## OAuth2 auth CLI
+  - id: archive-gmail-auth
+    env:
+      - CGO_ENABLED=0
+    main: ./cmd/authenticate
+    binary: archive-gmail-auth
     ldflags:
       - -s -w
       - -X main.Version={{.Version}}

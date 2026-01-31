@@ -6,7 +6,14 @@ if ! command -v go &>/dev/null; then
   exit 1
 fi
 
-echo "Build trimmed version of app to dist/archive-gmail"
+echo "Build trimmed version of app to dist/"
 
 mkdir -p dist
+
+## Main app
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/archive-gmail ./cmd/archive-gmail
+
+## Auth CLI
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/archive-gmail-auth ./cmd/authenticate
+
+echo "Built archive-gmail and archive-gmail-auth in dist/"
