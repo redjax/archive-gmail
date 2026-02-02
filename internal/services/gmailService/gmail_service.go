@@ -262,7 +262,7 @@ func authenticateOAuth2(c *client.Client, cfg config.Config) error {
 	}
 
 	// TokenSource auto-refresh
-	ts := conf.TokenSource(ctx, token)
+	ts := oauth2.ReuseTokenSource(token, conf.TokenSource(ctx, token))
 
 	getAccessToken := func() (string, error) {
 		tok, err := ts.Token()
