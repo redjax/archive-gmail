@@ -30,6 +30,9 @@ Set the following environment variables (if you're using `direnv`, create a `.en
 - `DRY_RUN`: Connect & validate without downloading anything
 - `FOLDERS_ONLY`: (default: "") Optional comma-separated list of folders to download
   - Example: INBOX,[Gmail]/All Mail
+- `CRON_SCHEDULE`: (default: "") If a cron schedule is set (or passed with `--schedule`), the job will run on that schedule.
+  - If a schedule overlaps, the latest is skipped, and the next schedule will run.
+  - Example: `0 */6 * * *` (every 6 hours).
 
 ## Build
 
