@@ -4,6 +4,7 @@ go 1.25.4
 
 require (
 	github.com/emersion/go-imap v1.2.1
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/sirupsen/logrus v1.9.4
 	golang.org/x/oauth2 v0.34.0
 )

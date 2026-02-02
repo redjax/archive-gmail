@@ -1,22 +1,23 @@
 package main
 
 import (
+	"flag"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	"github.com/sirupsen/logrus"
 
 	config "github.com/redjax/archive-gmail/internal/config"
 	gmailSvc "github.com/redjax/archive-gmail/internal/services/gmailService"
 )
 
-func main() {
-	cfg := config.LoadConfig()
-
+// runBackup executes the actual backup
+func runBackup(cfg config.Config) {
 	level, _ := logrus.ParseLevel(cfg.LogLevel)
 	logrus.SetLevel(level)
 
-	// SINGLE validation block - OAuth2 OR Password
 	useOAuth2 := cfg.ClientID != "" && cfg.ClientSecret != ""
 	if cfg.Email == "" {
 		logrus.Fatal("GMAIL_EMAIL is required")
@@ -25,7 +26,6 @@ func main() {
 		logrus.Fatal("Either GMAIL_PASSWORD OR (GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET) required")
 	}
 
-	// Connect handles auth logic
 	c, err := gmailSvc.Connect(cfg)
 	if err != nil {
 		logrus.Fatalf("IMAP connect failed: %v", err)
@@ -39,7 +39,7 @@ func main() {
 
 	start := time.Now()
 	var downloaded uint64
-	mu := sync.RWMutex{}
+	var mu sync.RWMutex
 
 	sem := make(chan struct{}, cfg.MaxWorkers)
 	var wg sync.WaitGroup
@@ -66,4 +66,72 @@ func main() {
 	elapsed := time.Since(start).Seconds()
 	rate := float64(downloaded) / elapsed
 	logrus.Infof("Archive complete: %d messages in %.1fs (%.2f msg/sec)", downloaded, elapsed, rate)
+}
+
+func main() {
+	cfg := config.LoadConfig()
+
+	schedule := flag.String("schedule", "", "Optional cron schedule (e.g. \"0 */5 * * *\")")
+	flag.Parse()
+
+	if *schedule == "" {
+		// No schedule: run once and exit
+		runBackup(cfg)
+		return
+	}
+
+	var running int32
+
+	// Parse the cron spec to calculate next run before starting
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	sched, err := parser.Parse(*schedule)
+	if err != nil {
+		logrus.Fatalf("Invalid cron schedule: %v", err)
+	}
+
+	// Print first scheduled run
+	nextRun := sched.Next(time.Now())
+	logrus.Infof("First scheduled backup at %s", nextRun.Format(time.RFC1123))
+
+	// Create cron
+	c := cron.New(cron.WithParser(parser))
+	var id cron.EntryID
+	id, err = c.AddFunc(*schedule, func() {
+		if atomic.LoadInt32(&running) == 0 {
+			atomic.StoreInt32(&running, 1)
+			go func(localID cron.EntryID) {
+				defer atomic.StoreInt32(&running, 0)
+				logrus.Infof("Starting scheduled backup")
+				runBackup(cfg)
+
+				// Print next scheduled run
+				next := c.Entry(localID).Next
+				logrus.Infof("Next scheduled backup at %s", next.Format(time.RFC1123))
+			}(id)
+		} else {
+			logrus.Info("Previous backup still running, skipping this tick")
+		}
+	})
+	if err != nil {
+		logrus.Fatalf("Failed to add cron function: %v", err)
+	}
+
+	c.Start()
+
+	// Run first backup immediately
+	if atomic.LoadInt32(&running) == 0 {
+		atomic.StoreInt32(&running, 1)
+		go func() {
+			defer atomic.StoreInt32(&running, 0)
+			logrus.Infof("Starting initial backup immediately")
+			runBackup(cfg)
+
+			// Print next scheduled run after first execution
+			next := c.Entry(id).Next
+			logrus.Infof("Next scheduled backup at %s", next.Format(time.RFC1123))
+		}()
+	}
+
+	// Keep program running
+	select {}
 }
