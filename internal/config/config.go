@@ -1,6 +1,7 @@
 package config
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,6 +23,8 @@ type Config struct {
 	ClientID        string
 	ClientSecret    string
 	OAuth2TokenFile string
+
+	CronSchedule string
 }
 
 func getenv(key, def string) string {
@@ -58,6 +61,11 @@ func LoadConfig() Config {
 	home, _ := os.UserHomeDir()
 	defaultTokenFile := filepath.Join(home, ".config", "archive_gmail", "token.json")
 
+	cronSchedule := os.Getenv("CRON_SCHEDULE")
+
+	// Define flag with env var as default
+	cronFlag := flag.String("schedule", cronSchedule, "Cron schedule (overrides CRON_SCHEDULE)")
+
 	return Config{
 		Email:           os.Getenv("GMAIL_EMAIL"),
 		Password:        os.Getenv("GMAIL_PASSWORD"),
@@ -72,5 +80,6 @@ func LoadConfig() Config {
 		ClientID:        getenv("GMAIL_CLIENT_ID", ""),
 		ClientSecret:    getenv("GMAIL_CLIENT_SECRET", ""),
 		OAuth2TokenFile: getenv("OAUTH2_TOKEN_FILE", defaultTokenFile),
+		CronSchedule:    *cronFlag,
 	}
 }

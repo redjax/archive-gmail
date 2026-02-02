@@ -71,20 +71,22 @@ func runBackup(cfg config.Config) {
 func main() {
 	cfg := config.LoadConfig()
 
-	schedule := flag.String("schedule", "", "Optional cron schedule (e.g. \"0 */5 * * *\")")
 	flag.Parse()
 
-	if *schedule == "" {
+	if cfg.CronSchedule == "" {
 		// No schedule: run once and exit
 		runBackup(cfg)
 		return
 	}
 
+	// Only print schedule info if CronSchedule has a value
+	logrus.Infof("Using schedule: %s", cfg.CronSchedule)
+
 	var running int32
 
 	// Parse the cron spec to calculate next run before starting
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	sched, err := parser.Parse(*schedule)
+	sched, err := parser.Parse(cfg.CronSchedule)
 	if err != nil {
 		logrus.Fatalf("Invalid cron schedule: %v", err)
 	}
@@ -96,7 +98,7 @@ func main() {
 	// Create cron
 	c := cron.New(cron.WithParser(parser))
 	var id cron.EntryID
-	id, err = c.AddFunc(*schedule, func() {
+	id, err = c.AddFunc(cfg.CronSchedule, func() {
 		if atomic.LoadInt32(&running) == 0 {
 			atomic.StoreInt32(&running, 1)
 			go func(localID cron.EntryID) {
