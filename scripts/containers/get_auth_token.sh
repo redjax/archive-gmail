@@ -10,7 +10,9 @@ mkdir -p "$TOKEN_DIR"
 
 ## Ensure .env is loaded
 if [[ -f "${CONTAINERS_DIR}/.env" ]]; then
-  export $(grep -v '^#' "${CONTAINERS_DIR}/.env" | xargs)
+  set -a
+  source "${CONTAINERS_DIR}/.env"
+  set +a
 fi
 
 ## Override token file for authenticate container
